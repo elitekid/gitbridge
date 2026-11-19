@@ -215,6 +215,11 @@ fn read_journal(git: &Git, stamp: &str) -> R<Vec<Entry>> {
     serde_json::from_str(&r.out).map_err(|e| format!("되돌리기 기록 {} 이 깨졌습니다: {}", stamp, e))
 }
 
+/// 화면 미리보기용: 기록 하나의 항목(참조·전 값·뒤 값)을 읽기만 한다.
+pub fn entries(git: &Git, stamp: &str) -> R<Vec<Entry>> {
+    read_journal(git, stamp)
+}
+
 /// (기록 이름, 항목 수) 최근 것부터.
 pub fn list(git: &Git) -> R<Vec<(String, usize)>> {
     let m = ref_map(git, &[UNDO_ROOT])?;

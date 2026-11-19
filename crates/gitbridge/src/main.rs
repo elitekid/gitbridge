@@ -1,4 +1,8 @@
-//! GitBridge 2.0.0 명령줄. 인자는 손으로 해석하고 모든 일은 gitbridge_core 가 한다.
+//! GitBridge 2.0.0. 인자 없이 실행하면 화면, 하위명령이 있으면 명령줄. 모든 일은 gitbridge_core 가 한다.
+// 화면 모드에서 콘솔 창이 뜨지 않게 GUI 서브시스템으로 만들고, 명령줄 모드에서는 부모 콘솔에 붙는다.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
+mod gui;
 
 use gitbridge_core::refs::{format_result, Outcome};
 use gitbridge_core::{apply, create, export, gitrun, log, queue, refresh, restore, store, undo, TOOL};
@@ -8,7 +12,8 @@ use std::process::ExitCode;
 const USAGE: &str = "\
 사용법: GitBridge <하위명령> [옵션]
 
-  export  --repo P --kind base|standard|all [--branch B] [--full] --out DIR
+  export  --repo P [--kind base|standard|all] [--branch B] [--full] --out DIR
+          (--kind 를 빼면 base. 1.0.5 의 --scope·--base-branch 도 같은 뜻으로 받는다)
   create  --repo P --branch B --out DIR [--full]
   refresh --repo P
   apply   --bundle F --repo P [--sync-all]
@@ -111,13 +116,16 @@ fn show(o: &Outcome, json: bool) -> ExitCode {
 fn run(cmd: &str, rest: &[String]) -> Result<ExitCode, String> {
     match cmd {
         "export" => {
-            let a = parse(rest, &["repo", "kind", "branch", "out"], &["full"])?;
-            let (repo, kind, out) = (a.need("repo")?, a.need("kind")?, a.need("out")?);
+            // --scope·--base-branch 는 1.0.5 의 이름이다. 같은 뜻으로 받고, 범위를 주지 않으면 1.0.5 처럼 base 다.
+            let a = parse(rest, &["repo", "kind", "scope", "branch", "base-branch", "out"], &["full"])?;
+            let (repo, out) = (a.need("repo")?, a.need("out")?);
+            let kind = a.opt("kind").or(a.opt("scope")).filter(|s| !s.is_empty()).unwrap_or("base");
+            let branch = a.opt("branch").or(a.opt("base-branch"));
             let init = |a: &Args| init_log(a.flag("json"));
             init(&a);
             let o = match kind {
-                "base" => export::export_base(repo, out, a.flag("full"), a.opt("branch")),
-                "standard" | "all" => export::export_repository(repo, out, kind, a.opt("branch"), a.flag("full")),
+                "base" => export::export_base(repo, out, a.flag("full"), branch),
+                "standard" | "all" => export::export_repository(repo, out, kind, branch, a.flag("full")),
                 _ => return Err("--kind 은 base, standard, all 중 하나여야 합니다.".into()),
             };
             record(&o, repo, o.file.as_deref());
@@ -252,21 +260,28 @@ fn init_log(json: bool) {
 
 #[cfg(windows)]
 fn console_utf8() {
+    use windows_sys::Win32::System::Console::{AttachConsole, SetConsoleOutputCP, ATTACH_PARENT_PROCESS};
     unsafe {
-        windows_sys::Win32::System::Console::SetConsoleOutputCP(65001);
+        // 파이프로 넘겨받은 표준 출력은 그대로 쓰이고, 콘솔에서 실행했으면 그 콘솔에 붙는다.
+        AttachConsole(ATTACH_PARENT_PROCESS);
+        SetConsoleOutputCP(65001);
     }
 }
 #[cfg(not(windows))]
 fn console_utf8() {}
 
 fn main() -> ExitCode {
-    console_utf8();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.is_empty() {
+        gui::update::cleanup_leftovers();
+        return gui::run();
+    }
+    console_utf8();
     if args.iter().any(|a| a == "--version") {
         println!("{}", TOOL);
         return ExitCode::SUCCESS;
     }
-    if args.is_empty() || args.iter().any(|a| a == "--help" || a == "-h") {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
         println!("{}\n\n{}", TOOL, USAGE);
         return ExitCode::SUCCESS;
     }

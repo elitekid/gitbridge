@@ -1442,12 +1442,13 @@ pub fn plan_remove(plan: &mut QueuePlan, idx: &[usize]) {
     prune_plan_temp(plan);
 }
 
-/// idx 줄 중 repo 가 있는 줄만 plan.rows 순서대로 처리한다. apply 가 거짓이면 '대기' 계획 결과만 낸다.
+/// idx 줄 중 repo 가 있는 줄만 plan_rows 순서대로 처리한다. apply 가 거짓이면 '대기' 계획 결과만 낸다.
 /// 각 Outcome.file 은 그 줄의 번들 경로다. repo 가 빈 줄은 결과에 넣지 않는다.
-pub fn plan_run(plan: &QueuePlan, idx: &[usize], apply: bool, cancel: &AtomicBool) -> Vec<Outcome> {
+/// 줄 사본만 받으므로 화면은 도는 동안에도 목록을 그대로 보여 준다(저장소를 다시 찾지 않는다).
+pub fn plan_run(plan_rows: &[PlanRow], idx: &[usize], apply: bool, cancel: &AtomicBool) -> Vec<Outcome> {
     let want: HashSet<usize> = idx.iter().copied().collect();
     let mut rows: Vec<Row> = Vec::new();
-    for (i, p) in plan.rows.iter().enumerate() {
+    for (i, p) in plan_rows.iter().enumerate() {
         if !want.contains(&i) || p.repo.is_empty() || p.head.is_none() {
             continue;
         }
