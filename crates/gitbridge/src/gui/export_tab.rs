@@ -1248,14 +1248,12 @@ fn start_make(st: &mut AppState) {
                 common::record(&o, repo, o.file.as_deref());
                 outs.push(o);
             } else {
-                p.set(format!("{} 번들 만드는 중", tag));
-                let o = if scope == "base" {
-                    export::export_base(repo, &out_dir, full, base.as_deref())
-                } else {
-                    export::export_repository(repo, &out_dir, &scope, base.as_deref(), full)
-                };
-                common::record(&o, repo, o.file.as_deref());
-                outs.push(o);
+                // 1.0.5 와 같게 번들을 만들기 앞에 서버 최신화(origin 추적 참조·기준 브랜치 포함 로컬 브랜치 갱신)를 먼저 한다. 최신화가 멈추면 그 저장소의 번들은 만들지 않는다.
+                p.set(format!("{} 서버 최신화 후 번들 만드는 중", tag));
+                for o in export::export_refreshed(repo, &out_dir, &scope, base.as_deref(), full) {
+                    common::record(&o, repo, o.file.as_deref());
+                    outs.push(o);
+                }
             }
         }
         // 1.0.5 와 같게, 이번 실행에서 실제로 만든 번들만 모아 2개 이상이면 ZIP 하나로 묶는다(출력 폴더에 예전부터 있던 번들은 담지 않는다).

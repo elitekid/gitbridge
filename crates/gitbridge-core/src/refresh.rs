@@ -3,6 +3,7 @@
 
 use crate::gitrun::Git;
 use crate::refs::*;
+use crate::snapshot::Snapshot;
 use crate::undo::UndoLog;
 use crate::R;
 use std::collections::BTreeMap;
@@ -76,10 +77,16 @@ pub fn refresh(repo: &str) -> Outcome {
         Ok(g) => g,
         Err(e) => return Outcome::stop(e),
     };
-    refresh_inner(&git).unwrap_or_else(|e| Outcome::stop(format!("예상하지 못한 오류로 멈췄습니다: {}", e)))
+    refresh_inner(&git, None).unwrap_or_else(|e| Outcome::stop(format!("예상하지 못한 오류로 멈췄습니다: {}", e)))
 }
 
-fn refresh_inner(git: &Git) -> R<Outcome> {
+/// 번들 만들기 앞의 최신화. 이미 받아 둔 서버 스냅샷(origin 추적 참조 포함)의 값으로 로컬 브랜치를 옮겨, 최신화와 번들이 같은 서버 값을 쓴다.
+pub fn refresh_with_snapshot(git: &Git, snap: &Snapshot) -> Outcome {
+    crate::log::say("===== 서버 최신화 — 번들 만들기 앞 단계");
+    refresh_inner(git, Some(snap)).unwrap_or_else(|e| Outcome::stop(format!("예상하지 못한 오류로 멈췄습니다: {}", e)))
+}
+
+fn refresh_inner(git: &Git, snap: Option<&Snapshot>) -> R<Outcome> {
     if !git.q(&["rev-parse", "--show-toplevel"])?.ok() {
         return Ok(Outcome::stop("고른 폴더가 git 저장소가 아닙니다."));
     }
@@ -89,12 +96,16 @@ fn refresh_inner(git: &Git) -> R<Outcome> {
     if !git.q(&["remote", "get-url", "origin"])?.ok() {
         return Ok(Outcome::stop("서버 주소(origin)가 없어 서버 최신화를 할 수 없습니다."));
     }
-    let f = git.run(&["fetch", "--atomic", "--prune", "--no-tags", "origin", "+refs/heads/*:refs/remotes/origin/*"])?;
-    if !f.ok() {
-        return Ok(Outcome::stop(format!("서버 브랜치를 읽지 못했습니다. 네트워크와 GitLab 인증을 확인해 주세요.\n{}", f.detail())));
+    if snap.is_none() {
+        let f = git.run(&["fetch", "--atomic", "--prune", "--no-tags", "origin", "+refs/heads/*:refs/remotes/origin/*"])?;
+        if !f.ok() {
+            return Ok(Outcome::stop(format!("서버 브랜치를 읽지 못했습니다. 네트워크와 GitLab 인증을 확인해 주세요.\n{}", f.detail())));
+        }
     }
     let local = ref_map(git, &["refs/heads/"])?;
-    let remote: BTreeMap<String, String> =
+    let remote: BTreeMap<String, String> = if let Some(s) = snap {
+        s.heads.clone()
+    } else {
         strip_map(&ref_map(git, &["refs/remotes/origin/"]).or_else(|_| -> R<_> {
             // origin/HEAD 는 간접 참조라 ref_map 이 거절한다. 그때는 직접 읽는다.
             let r = git.q(&["for-each-ref", "--format=%(refname)\t%(objectname)", "refs/remotes/origin/"])?;
@@ -102,7 +113,8 @@ fn refresh_inner(git: &Git) -> R<Outcome> {
         })?, "refs/remotes/origin/")
         .into_iter()
         .filter(|(n, _)| n != "HEAD")
-        .collect();
+        .collect()
+    };
     let checked = worktree_branches(git)?;
     let cur = git.q(&["symbolic-ref", "--quiet", "--short", "HEAD"])?;
     let current_branch = if cur.ok() { cur.out.trim().to_string() } else { String::new() };

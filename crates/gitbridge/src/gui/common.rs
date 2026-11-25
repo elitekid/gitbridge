@@ -156,7 +156,7 @@ pub fn show_outcome(ui: &mut egui::Ui, o: &Outcome) {
     }
     if let Some(a) = o.main_ahead {
         if a > 0 {
-            ui.label(RichText::new(format!("서버 기준 브랜치가 이 브랜치보다 {}개 앞서 있습니다. 머지는 인텔리제이에서 해 주세요.", a)).color(Status::Check.color()));
+            ui.label(RichText::new(format!("서버 기준 브랜치가 이 브랜치보다 {}개 앞서 있습니다. 머지는 직접 해 주세요.", a)).color(Status::Check.color()));
         }
     }
     if let Some(f) = &o.file {

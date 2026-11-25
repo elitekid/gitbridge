@@ -195,20 +195,48 @@ pub fn export_base(repo: &str, out_dir: &str, full: bool, branch: Option<&str>) 
 /// 저장소 번들. standard 는 기준 브랜치와 develop·모든 태그, all 은 모든 브랜치·태그.
 /// standard 는 표식이 모두 조상일 때 증분으로, all 은 늘 전체로 만든다.
 pub fn export_repository(repo: &str, out_dir: &str, scope: &str, branch: Option<&str>, full: bool) -> Outcome {
+    export_repository_run(repo, out_dir, scope, branch, full, false).pop().unwrap_or_else(|| Outcome::stop("결과가 없습니다."))
+}
+
+/// 번들 만들기 앞에 서버 최신화(origin 추적 참조·기준 브랜치 등 로컬 브랜치 갱신)를 먼저 한다(1.0.5 와 같음). base 는 최신화를 하고 기준 번들을, standard·all 은 한 번 받은 서버 값으로 최신화와 번들을 만든다.
+/// 결과는 [최신화, 번들] 순서이며, 최신화가 멈추면 번들은 만들지 않고 최신화 결과만 돌려준다. 작업 브랜치(feature) 번들은 서버에 닿지 않는 PC 를 위해 이 함수가 아니라 create_feature 를 쓴다.
+pub fn export_refreshed(repo: &str, out_dir: &str, scope: &str, branch: Option<&str>, full: bool) -> Vec<Outcome> {
+    match scope {
+        "base" => {
+            let r = crate::refresh::refresh(repo);
+            if !r.ok {
+                return vec![r];
+            }
+            vec![r, export_base(repo, out_dir, full, branch)]
+        }
+        _ => export_repository_run(repo, out_dir, scope, branch, full, true),
+    }
+}
+
+fn export_repository_run(repo: &str, out_dir: &str, scope: &str, branch: Option<&str>, full: bool, refresh_first: bool) -> Vec<Outcome> {
     if scope != "standard" && scope != "all" {
-        return Outcome::stop(format!("알 수 없는 저장소 범위입니다: {}", scope));
+        return vec![Outcome::stop(format!("알 수 없는 저장소 범위입니다: {}", scope))];
     }
     let out_dir = absolute_out_dir(out_dir);
     let out_dir = out_dir.as_str();
     crate::log::say(&format!("===== 저장소 브랜치·태그 번들 만들기 — 저장소 {} / 범위 {} / 기준 브랜치 {}", repo, scope, branch.unwrap_or("auto")));
     let git = match Git::open(repo) {
         Ok(g) => g,
-        Err(e) => return Outcome::stop(e),
+        Err(e) => return vec![Outcome::stop(e)],
     };
-    let snap = match Snapshot::fetch(&git, false) {
+    // 최신화를 함께 할 때는 origin 추적 참조도 같은 fetch 로 갱신한다.
+    let snap = match Snapshot::fetch(&git, refresh_first) {
         Ok(s) => s,
-        Err(e) => return Outcome::stop(format!("서버 브랜치·태그 번들을 만들지 못했습니다: {}", e)),
+        Err(e) => return vec![Outcome::stop(format!("서버 브랜치·태그 번들을 만들지 못했습니다: {}", e))],
     };
+    let mut pre: Option<Outcome> = None;
+    if refresh_first {
+        let r = crate::refresh::refresh_with_snapshot(&git, &snap);
+        if !r.ok {
+            return vec![r];
+        }
+        pre = Some(r);
+    }
     let mut created: Option<String> = None;
     let mut made: BTreeMap<String, String> = BTreeMap::new();
     let mut lock: Option<ExportLock> = None;
@@ -241,7 +269,7 @@ pub fn export_repository(repo: &str, out_dir: &str, scope: &str, branch: Option<
         let p = res.push_note.take().unwrap_or_default();
         res.push_note = Some([p].into_iter().chain(notes).filter(|x| !x.is_empty()).collect::<Vec<_>>().join("\n"));
     }
-    res
+    pre.into_iter().chain(std::iter::once(res)).collect()
 }
 
 #[allow(clippy::too_many_arguments)]

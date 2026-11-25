@@ -2,7 +2,7 @@
 //! 2.0.0 은 원격에 쓰지 않는다(로컬 적용 전용).
 
 use super::common::{pick_bundles, pick_folder, setting_str, show_outcomes};
-use super::plan_list::PlanList;
+use super::plan_list::{repo_name, PlanList};
 use super::theme::Bold;
 use super::worker::{Apply, Live, Progress};
 use super::{theme, widgets, AppState};
@@ -251,7 +251,7 @@ pub fn ui(st: &mut AppState, ui: &mut egui::Ui) {
                     ui.add_space(widgets::GAP_S);
                     widgets::small(
                         ui,
-                        "폴더 안의 번들·ZIP 을 위에서부터 차례로 적용합니다. 저장소는 저장소 모음 폴더 아래에서 찾고, 이미 적용한 번들은 건너뜁니다. 맞는 저장소가 없을 때 전체를 담은 번들은 저장소 모음 폴더 아래에 새 저장소로 만듭니다.",
+                        "폴더 안의 번들·ZIP 을 위에서부터 차례로 적용합니다. 저장소는 저장소 모음 폴더 아래에서 찾고, 이미 적용한 번들은 건너뜁니다. 맞는 저장소가 없을 때 기준·저장소 번들 중 전체 이력을 담은 번들은 저장소 모음 폴더 아래에 새 저장소로 만듭니다.",
                     );
                     if hovering {
                         ui.add_space(widgets::GAP_S);
@@ -271,9 +271,9 @@ pub fn ui(st: &mut AppState, ui: &mut egui::Ui) {
                         }
                     });
                     ui.add_space(2.0);
-                    widgets::small(ui, "번들을 올리면 번들마다 저장소를 바로 찾아 보여 줍니다. 저장소가 없는 번들은 적용하지 않으니 [저장소 바꾸기…]나 [새 저장소 만들기…]로 정해 주세요.");
+                    widgets::small(ui, "번들을 올리면 번들마다 저장소를 바로 찾아 보여 줍니다. 저장소를 못 찾은 번들은 적용하지 않습니다. 기준·저장소 번들 중 전체 이력을 담은 번들은 저장소 모음 폴더 아래에 새 저장소로 자동으로 만들고(저장소 모음 폴더가 유효해야 하고 같은 이름 폴더가 없어야 합니다), 그 밖의 번들은 [저장소 바꾸기…]나 [새 저장소 만들기…]로 정해 주세요.");
                     if !loading && missing > 0 && s.src_root.trim().is_empty() {
-                        widgets::small(ui, "저장소 모음 폴더를 정하면 저장소를 자동으로 찾습니다.");
+                        widgets::small(ui, "저장소 모음 폴더를 정하면 저장소를 자동으로 찾고, 기준·저장소 번들 중 전체 이력을 담은 번들은 그 아래에 새 저장소로 만듭니다.");
                     }
                     ui.add_space(widgets::GAP_S);
                     // 도구 줄
@@ -632,12 +632,6 @@ fn run_plan_checked(st: &mut AppState, apply: bool, confirmed: bool) {
     launch_plan_run(st, apply, idx);
 }
 
-/// 저장소 경로의 마지막 폴더 이름(진행 줄에 짧게 보인다).
-fn repo_folder(p: &str) -> String {
-    let t = p.trim_end_matches(['\\', '/']);
-    t.rsplit(['\\', '/']).next().filter(|s| !s.is_empty()).unwrap_or(p).to_string()
-}
-
 /// 적용·미리보기는 줄 사본으로 돌린다. 목록(plan)은 화면에 그대로 두어 '저장소를 찾는 중'으로 바뀌지 않게 하고,
 /// 도는 동안 목록 편집은 busy 로 잠근다(풀어 둔 ZIP 임시 폴더도 plan 이 계속 쥐고 있다).
 fn launch_plan_run(st: &mut AppState, apply: bool, idx: Vec<usize>) {
@@ -648,15 +642,12 @@ fn launch_plan_run(st: &mut AppState, apply: bool, idx: Vec<usize>) {
     let Some(rows) = st.apply.list.plan.as_ref().map(|p| p.rows.clone()) else {
         return;
     };
-    if apply {
-        // 줄마다 '순서 대기 → 적용 중 → 결과'로 바뀌어 보이게 한다.
-        st.apply.list.begin_run(&idx);
-    }
-    st.spawn(if apply { "번들 목록 적용" } else { "번들 목록 미리보기" }, move |p: &Progress| -> Apply {
+    let run_idx = idx.clone();
+    let spawned = st.spawn(if apply { "번들 목록 적용" } else { "번들 목록 미리보기" }, move |p: &Progress| -> Apply {
         p.set(if apply { "번들마다 저장소에 적용하는 중" } else { "적용 계획을 만드는 중 (저장소는 바꾸지 않습니다)" });
         let outcomes = queue::plan_run_live(&rows, &idx, apply, p.cancel_flag(), &mut |ev| match ev {
-            RunEvent::Start { file, name, repo, pos, total } => {
-                p.set(format!("{}/{} 적용 중 — {} → {}", pos + 1, total, name, repo_folder(repo)));
+            RunEvent::Start { file, name, repo } => {
+                p.set(format!("적용 중 — {} → {}", name, repo_name(repo)));
                 p.push_live(Live::Start { file: file.to_string() });
             }
             RunEvent::Done { outcome, retry } => p.push_live(Live::Done { outcome: outcome.clone(), retry }),
@@ -664,6 +655,8 @@ fn launch_plan_run(st: &mut AppState, apply: bool, idx: Vec<usize>) {
         Box::new(move |st: &mut AppState| {
             let mut outcomes = outcomes;
             if apply {
+                // 끝나는 프레임에 진행 표시를 바로 걷는다(다른 작업이 이어 떠도 '적용 중'이 남지 않게).
+                st.apply.list.end_run();
                 reload_after_run(st);
                 st.apply.list.apply_results(&outcomes);
                 st.apply.list.show_names(&mut outcomes);
@@ -675,6 +668,11 @@ fn launch_plan_run(st: &mut AppState, apply: bool, idx: Vec<usize>) {
             }
         })
     });
+    if spawned && apply {
+        // 작업을 띄운 뒤에만 줄마다 '순서 대기 → 적용 중 → 결과'로 바뀌어 보이게 한다(못 띄우면 이전 결과를 그대로 둔다).
+        // 작업 스레드의 소식은 다음 프레임에야 꺼내므로 같은 프레임에 표시를 깔아도 늦지 않다.
+        st.apply.list.begin_run(&run_idx);
+    }
 }
 
 /// 적용. 폴더 큐도 파일 목록(plan)도 엔진이 기록까지 한다.

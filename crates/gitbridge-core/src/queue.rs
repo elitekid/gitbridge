@@ -871,16 +871,33 @@ fn repo_fit_problem(rows: &[Row], i: usize) -> Option<String> {
     ))
 }
 
-/// pending(rows 의 색인) 줄을 위에서부터 적용하고(apply 가 참일 때), 모든 줄의 결과를 rows 순서로 out 에 붙인다.
-/// 앞 번들이 아직 안 들어가 "기대는 커밋이 없다"로 멈춘 줄은 재시도하고, 취소되면 남은 줄은 '취소로 보류'로 남긴다.
 /// 적용 중 줄 하나마다 보내는 진행 알림.
 pub enum RunEvent<'a> {
-    /// pos(0부터, 이번 실행 줄 순서)번째 줄의 적용을 시작한다. file 은 줄의 번들 경로.
-    Start { file: &'a str, name: &'a str, repo: &'a str, pos: usize, total: usize },
-    /// 한 줄의 결과. retry 가 참이면 앞 번들을 기다리느라 뒤에서 한 번 더 시도한다.
+    /// 한 줄의 적용을 시작한다. file 은 줄의 번들 경로.
+    Start { file: &'a str, name: &'a str, repo: &'a str },
+    /// 한 줄의 결과. retry 가 참이면 앞 번들을 기다리느라 뒤에서 한 번 더 시도할 수 있다
+    /// (다시 시도하지 않고 끝나면 같은 줄의 최종 결과가 retry 거짓으로 한 번 더 온다).
     Done { outcome: &'a Outcome, retry: bool },
 }
 
+/// 결과 첫 줄에 판정한 로컬 폴더 전체 경로를 붙인다(최종 결과와 진행 알림이 같은 글을 쓰게).
+fn with_repo_line(repo: &str, mut o: Outcome) -> Outcome {
+    if !repo.is_empty() && !o.message.starts_with(REPO_LINE) {
+        o.message = format!("{}{}\n{}", REPO_LINE, repo, o.message);
+    }
+    o
+}
+
+/// 줄의 현재 결과를 진행 알림으로 보낸다.
+fn emit_done(on_event: &mut dyn FnMut(RunEvent), row: &Row, retry: bool) {
+    if let Some(o) = &row.result {
+        let o = with_repo_line(&row.repo, o.clone());
+        on_event(RunEvent::Done { outcome: &o, retry });
+    }
+}
+
+/// pending(rows 의 색인) 줄을 위에서부터 적용하고(apply 가 참일 때), 모든 줄의 결과를 rows 순서로 out 에 붙인다.
+/// 앞 번들이 아직 안 들어가 "기대는 커밋이 없다"로 멈춘 줄은 재시도하고, 취소되면 남은 줄은 '취소로 보류'로 남긴다.
 fn run_apply_rows(rows: &mut [Row], mut pending: Vec<usize>, apply: bool, settings: &mut Value, out: &mut Vec<Outcome>, cancel: &AtomicBool, on_event: &mut dyn FnMut(RunEvent)) {
     if apply {
         let mut recorded: HashSet<usize> = HashSet::new();
@@ -906,7 +923,7 @@ fn run_apply_rows(rows: &mut [Row], mut pending: Vec<usize>, apply: bool, settin
                     attempted.push(i);
                 }
                 crate::log::say(&format!("===== [{}] {} → {}", i + 1, base_name(&rows[i].path), rows[i].repo));
-                on_event(RunEvent::Start { file: &rows[i].path, name: &base_name(&rows[i].path), repo: &rows[i].repo, pos: i, total: rows.len() });
+                on_event(RunEvent::Start { file: &rows[i].path, name: &base_name(&rows[i].path), repo: &rows[i].repo });
                 if let Some(msg) = repo_fit_problem(rows, i) {
                     let mut o = Outcome::stop(msg);
                     o.file = Some(rows[i].path.clone());
@@ -914,7 +931,7 @@ fn run_apply_rows(rows: &mut [Row], mut pending: Vec<usize>, apply: bool, settin
                     rows[i].result = Some(o);
                     record(&rows[i], rows[i].result.as_ref().unwrap());
                     recorded.insert(i);
-                    on_event(RunEvent::Done { outcome: rows[i].result.as_ref().unwrap(), retry: false });
+                    emit_done(on_event, &rows[i], false);
                     continue;
                 }
                 let mut o = crate::apply::apply(&rows[i].path, &rows[i].repo, rows[i].sync_all);
@@ -930,7 +947,7 @@ fn run_apply_rows(rows: &mut [Row], mut pending: Vec<usize>, apply: bool, settin
                     progress = true;
                 }
                 rows[i].result = Some(o);
-                on_event(RunEvent::Done { outcome: rows[i].result.as_ref().unwrap(), retry: again });
+                emit_done(on_event, &rows[i], again);
                 if again {
                     retry.push(i);
                 } else {
@@ -943,6 +960,10 @@ fn run_apply_rows(rows: &mut [Row], mut pending: Vec<usize>, apply: bool, settin
             }
             pending = retry;
             if !(progress && !pending.is_empty() && rnd < 20) {
+                // 더 시도하지 않고 끝나는 줄은 마지막 결과를 확정해 알린다.
+                for &i in &pending {
+                    emit_done(on_event, &rows[i], false);
+                }
                 break;
             }
         }
@@ -985,18 +1006,13 @@ fn run_apply_rows(rows: &mut [Row], mut pending: Vec<usize>, apply: bool, settin
             o.file = Some(rows[i].path.clone());
             rows[i].status = format!("[{}] {}", o.kind, first_line(&o.message));
             rows[i].result = Some(o);
+            emit_done(on_event, &rows[i], false);
         }
     }
 
     for (i, row) in rows.iter().enumerate() {
         // 결과 첫 줄에 판정한 로컬 폴더 전체 경로를 적는다.
-        let with_repo = |mut o: Outcome| -> Outcome {
-            if !row.repo.is_empty() && !o.message.starts_with(REPO_LINE) {
-                o.message = format!("{}{}
-{}", REPO_LINE, row.repo, o.message);
-            }
-            o
-        };
+        let with_repo = |o: Outcome| -> Outcome { with_repo_line(&row.repo, o) };
         match &row.result {
             Some(o) => out.push(with_repo(o.clone())),
             None if row.repo.is_empty() => out.push(Outcome::stop(format!("{} — {}", base_name(&row.path), row.note))),

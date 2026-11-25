@@ -72,6 +72,10 @@ pub struct PlanList {
     run_stop: usize,
     /// 방금 적용을 시작한 줄(표가 그 줄로 스크롤한다).
     follow: Option<usize>,
+    /// 이번 실행 중 사용자가 목록을 직접 스크롤했다(그러면 더는 적용 중인 줄로 끌고 가지 않는다).
+    user_scrolled: bool,
+    /// 실행이 끝나 결과 칸이 커지면 따라가기로 밀려난 스크롤을 맨 위로 되돌린다(사용자가 직접 스크롤했으면 두지 않는다).
+    reset_scroll: bool,
 }
 
 /// 실행 결과 하나를 줄 상태 칸에 보일 모양으로 만든다.
@@ -89,8 +93,8 @@ fn default_checked(r: &PlanRow) -> bool {
     !r.repo.is_empty() && r.checked && r.seen.is_empty()
 }
 
-/// 경로의 마지막 폴더 이름.
-fn repo_name(p: &str) -> String {
+/// 경로의 마지막 폴더 이름(목록 저장소 칸과 적용 중 진행 줄에 쓴다).
+pub(super) fn repo_name(p: &str) -> String {
     let t = p.trim_end_matches(['\\', '/']);
     t.rsplit(['\\', '/']).next().filter(|s| !s.is_empty()).unwrap_or(p).to_string()
 }
@@ -138,10 +142,11 @@ impl PlanList {
         self.run_done = 0;
         self.run_stop = 0;
         self.follow = None;
+        self.user_scrolled = false;
     }
 
     /// 실행이 끝났거나 멈췄을 때 진행 표시를 걷는다(작업이 비정상으로 끝나도 '적용 중'이 남지 않게 매 프레임 확인).
-    fn end_run(&mut self) {
+    pub fn end_run(&mut self) {
         if self.run_total == 0 && self.follow.is_none() && self.rows.iter().all(|u| u.run == RunState::Idle) {
             return;
         }
@@ -152,16 +157,19 @@ impl PlanList {
         self.run_done = 0;
         self.run_stop = 0;
         self.follow = None;
+        self.reset_scroll = !self.user_scrolled;
     }
 
     /// 작업 스레드가 올린 줄 단위 소식을 줄 상태에 바로 반영한다(매 프레임).
     pub fn pump(&mut self, events: Vec<Live>) {
         for ev in events {
             match ev {
-                Live::Start { file, .. } => {
+                Live::Start { file } => {
                     if let Some(i) = self.rows.iter().position(|u| u.path == file) {
                         self.rows[i].run = RunState::Running;
-                        self.follow = Some(i);
+                        if !self.user_scrolled {
+                            self.follow = Some(i);
+                        }
                     }
                 }
                 Live::Done { outcome, retry } => {
@@ -188,12 +196,12 @@ impl PlanList {
         }
     }
 
-    /// 적용 중이면 목록 위에 보일 한 줄(끝난 줄 수 / 이번 실행 줄 수).
+    /// 적용 중이면 목록 위에 보일 한 줄(완료한 줄 수 / 이번 실행 줄 수). 아래 진행 줄에는 숫자 없이 지금 줄만 보인다.
     pub fn run_text(&self) -> Option<String> {
         if self.run_total == 0 {
             return None;
         }
-        let mut t = format!("적용 중 {}/{}", self.run_done, self.run_total);
+        let mut t = format!("적용 중 · 완료 {}/{}", self.run_done, self.run_total);
         if self.run_stop > 0 {
             t += &format!(" · 멈춤 {}개", self.run_stop);
         }
@@ -487,6 +495,9 @@ impl PlanList {
         let Some(plan) = self.plan.as_ref() else { return };
         let rows_ui = &mut self.rows;
         let follow = self.follow.take();
+        let reset_scroll = std::mem::take(&mut self.reset_scroll);
+        let running = self.run_total > 0;
+        let mut scrolled_now = false;
         let mut col = self.col.unwrap_or(COL_DEFAULT);
         let mut col_changed = false;
         let mut clicked: Option<(usize, bool)> = None;
@@ -500,6 +511,13 @@ impl PlanList {
             let cw = ui.available_width() - ui.spacing().scroll.allocated_width();
             let name_x = 2.0 + CHK_W;
             let rest = (cw - name_x - 2.0 - 16.0).max(120.0);
+            // 창이 좁아져 저장된 비율이 상태 칸 최소 폭을 침범하면 폭을 계산하기 전에 보정한다(저장값은 끌 때만 바뀐다).
+            let min_f = (COL_MIN_W / rest).min(0.3);
+            if col[0] + col[1] > 1.0 - min_f {
+                let hi = (1.0 - min_f - min_f).max(min_f);
+                col[0] = col[0].clamp(min_f, hi);
+                col[1] = col[1].min((1.0 - min_f - col[0]).max(min_f));
+            }
             let name_w = rest * col[0];
             let repo_w = rest * col[1];
             let st_w = rest - name_w - repo_w;
@@ -517,7 +535,6 @@ impl PlanList {
                     });
                 }
                 // 칼럼 경계를 끌어 폭을 바꾼다(두 번 누르면 기본 폭). 번들 경계는 번들 칸, 저장소 경계는 저장소 칸 폭을 바꾸고 상태 칸이 나머지를 쓴다.
-                let min_f = (COL_MIN_W / rest).min(0.3);
                 for k in 0..2 {
                     let bx = head.left() + if k == 0 { repo_x } else { st_x } - 4.0;
                     let hr = egui::Rect::from_center_size(egui::pos2(bx, head.center().y), egui::vec2(10.0, head.height()));
@@ -542,21 +559,32 @@ impl PlanList {
                     }
                 }
             }
-            egui::ScrollArea::vertical().id_salt("apply_plan_list").auto_shrink([false, false]).show(ui, |ui| {
+            let mut area = egui::ScrollArea::vertical().id_salt("apply_plan_list").auto_shrink([false, false]);
+            if reset_scroll {
+                area = area.vertical_scroll_offset(0.0);
+            }
+            let list_out = area.show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 for (i, (r, u)) in plan.rows.iter().zip(rows_ui.iter_mut()).enumerate() {
                     let row = widgets::row_rect(ui, widgets::ROW_H);
-                    if follow == Some(i) {
+                    // 새로 적용을 시작한 줄이 화면 밖일 때만 그 줄로 스크롤한다(보이면 그대로 둔다).
+                    if follow == Some(i) && !ui.clip_rect().contains_rect(row) {
                         ui.scroll_to_rect(row, Some(egui::Align::Center));
                     }
                     // 줄 전체 클릭(선택). 뒤에 만드는 체크 칸이 자기 영역의 클릭을 가져간다.
                     let rr = ui.interact(row, ui.scope_id().with(("plan_row", i)), egui::Sense::click());
-                    if u.run == RunState::Running {
-                        ui.painter().rect_filled(egui::Rect::from_min_max(row.min, egui::pos2(row.max.x, row.max.y - 1.0)), CornerRadius::ZERO, RUN_BG);
-                    }
-                    if u.selected || rr.hovered() {
+                    let body = egui::Rect::from_min_max(row.min, egui::pos2(row.max.x, row.max.y - 1.0));
+                    let marked = u.selected || rr.hovered();
+                    if marked {
                         let fill = if u.selected { theme::SEL_BG } else { ui.visuals().faint_bg_color };
-                        ui.painter().rect_filled(egui::Rect::from_min_max(row.min, egui::pos2(row.max.x, row.max.y - 1.0)), CornerRadius::ZERO, fill);
+                        ui.painter().rect_filled(body, CornerRadius::ZERO, fill);
+                    }
+                    if u.run == RunState::Running {
+                        // 선택·호버 배경이 있어도 적용 중임이 보이게 왼쪽에 띠를 항상 긋는다.
+                        if !marked {
+                            ui.painter().rect_filled(body, CornerRadius::ZERO, RUN_BG);
+                        }
+                        ui.painter().rect_filled(egui::Rect::from_min_size(body.min, egui::vec2(3.0, body.height())), CornerRadius::ZERO, theme::ACCENT);
                     }
                     if rr.clicked() {
                         clicked = Some((i, ctrl));
@@ -626,7 +654,22 @@ impl PlanList {
                     });
                 }
             });
+            // 적용 중 사용자가 목록을 직접 스크롤하면(휠·스크롤바 끌기) 이번 실행에서는 더 끌고 가지 않는다.
+            if running {
+                let inner = list_out.inner_rect;
+                let bar = egui::Rect::from_min_max(egui::pos2(inner.right() - 14.0, inner.top()), inner.max);
+                scrolled_now = ui.input(|i| {
+                    let over = i.pointer.hover_pos().map(|p| inner.contains(p)).unwrap_or(false);
+                    let wheel = over && i.smooth_scroll_delta.y != 0.0;
+                    // 스크롤바 위에서 누른 채 실제로 움직였을 때만(단순 클릭은 제외).
+                    let drag = i.pointer.primary_down() && i.pointer.delta().y != 0.0 && i.pointer.hover_pos().map(|p| bar.contains(p)).unwrap_or(false);
+                    wheel || drag
+                });
+            }
         });
+        if scrolled_now {
+            self.user_scrolled = true;
+        }
         if col_changed {
             self.col = Some(col);
         }

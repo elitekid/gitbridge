@@ -136,7 +136,7 @@ fn feature_inner(git: &Git, bundle: &str, undo: &mut UndoLog, temp: &mut Vec<Str
         return Ok(Outcome::stop("고른 폴더가 git 저장소가 아닙니다."));
     }
     if let Some(m) = in_progress_mark(git) {
-        return Ok(Outcome::stop(format!("저장소가 머지·리베이스 등 진행 중인 상태입니다 ({}). 인텔리제이에서 먼저 끝내거나 취소해 주세요.", m)));
+        return Ok(Outcome::stop(format!("저장소가 머지·리베이스 등 진행 중인 상태입니다 ({}). Git 도구에서 먼저 끝내거나 취소해 주세요.", m)));
     }
     clear_leftover_import_refs(git);
 
