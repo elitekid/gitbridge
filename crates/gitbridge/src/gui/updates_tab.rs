@@ -41,6 +41,15 @@ pub fn ui(st: &mut AppState, ui: &mut egui::Ui) {
         }
         ui.add_space(8.0);
 
+        ui.label(RichText::new("2.0.4").bold().size(16.0));
+        for l in [
+            "번들 만들기 탭의 작업 브랜치 목록이, 앱 밖에서 만든 브랜치를 보고 있는 동안 몇 초 안에 자동으로 반영됩니다. 이전에는 [새 저장소 다시 찾기]를 눌러야 보였습니다.",
+            "번들 만들기·미리보기를 시작할 때도 브랜치 정보를 다시 읽습니다.",
+        ] {
+            ui.label(format!("- {}", l));
+        }
+        ui.add_space(6.0);
+
         ui.label(RichText::new("2.0.3").bold().size(16.0));
         for l in ["업데이트 탭 변경 내역에 2.0.2 항목이 빠져 있던 것을 채웠습니다."] {
             ui.label(format!("- {}", l));
