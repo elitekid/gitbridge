@@ -4,10 +4,10 @@
 use super::common::{pick_bundles, pick_folder, setting_str, show_outcomes};
 use super::plan_list::PlanList;
 use super::theme::Bold;
-use super::worker::{Apply, Progress};
+use super::worker::{Apply, Live, Progress};
 use super::{theme, widgets, AppState};
 use eframe::egui::{self, CornerRadius, Margin, RichText, Stroke};
-use gitbridge_core::queue::{self, QueuePlan};
+use gitbridge_core::queue::{self, QueuePlan, RunEvent};
 use gitbridge_core::refs::Outcome;
 use serde_json::json;
 
@@ -125,6 +125,13 @@ pub fn ui(st: &mut AppState, ui: &mut egui::Ui) {
     let running = st.busy();
     if st.apply.list.ensure(running) {
         st.notice = "번들 목록을 읽던 작업이 끝나지 못해 목록을 비웠습니다. 다시 올려 주세요.".into();
+    }
+    // 적용 중이면 작업 스레드가 올린 줄별 진행을 줄 상태에 바로 반영한다.
+    if let Some(r) = &st.jobs.running {
+        let live = r.progress.take_live();
+        if !live.is_empty() {
+            st.apply.list.pump(live);
+        }
     }
     // 전체 동기화 확인 창이 떠 있는 동안에는 끌어다 놓은 파일을 받지 않는다(확인한 대상이 바뀌지 않게).
     let (mut saves, dropped) = if st.apply.sync_confirm.is_none() { take_drops(st, &ctx) } else { (Vec::new(), Vec::new()) };
@@ -260,7 +267,7 @@ pub fn ui(st: &mut AppState, ui: &mut egui::Ui) {
                         if loading {
                             ui.label(RichText::new("불러오는 중…").bold().color(theme::ACCENT));
                         } else {
-                            ui.label(RichText::new(s.list.summary_text()).bold().color(theme::ACCENT));
+                            ui.label(RichText::new(s.list.run_text().unwrap_or_else(|| s.list.summary_text())).bold().color(theme::ACCENT));
                         }
                     });
                     ui.add_space(2.0);
@@ -625,6 +632,12 @@ fn run_plan_checked(st: &mut AppState, apply: bool, confirmed: bool) {
     launch_plan_run(st, apply, idx);
 }
 
+/// 저장소 경로의 마지막 폴더 이름(진행 줄에 짧게 보인다).
+fn repo_folder(p: &str) -> String {
+    let t = p.trim_end_matches(['\\', '/']);
+    t.rsplit(['\\', '/']).next().filter(|s| !s.is_empty()).unwrap_or(p).to_string()
+}
+
 /// 적용·미리보기는 줄 사본으로 돌린다. 목록(plan)은 화면에 그대로 두어 '저장소를 찾는 중'으로 바뀌지 않게 하고,
 /// 도는 동안 목록 편집은 busy 로 잠근다(풀어 둔 ZIP 임시 폴더도 plan 이 계속 쥐고 있다).
 fn launch_plan_run(st: &mut AppState, apply: bool, idx: Vec<usize>) {
@@ -635,9 +648,19 @@ fn launch_plan_run(st: &mut AppState, apply: bool, idx: Vec<usize>) {
     let Some(rows) = st.apply.list.plan.as_ref().map(|p| p.rows.clone()) else {
         return;
     };
+    if apply {
+        // 줄마다 '순서 대기 → 적용 중 → 결과'로 바뀌어 보이게 한다.
+        st.apply.list.begin_run(&idx);
+    }
     st.spawn(if apply { "번들 목록 적용" } else { "번들 목록 미리보기" }, move |p: &Progress| -> Apply {
         p.set(if apply { "번들마다 저장소에 적용하는 중" } else { "적용 계획을 만드는 중 (저장소는 바꾸지 않습니다)" });
-        let outcomes = queue::plan_run(&rows, &idx, apply, p.cancel_flag());
+        let outcomes = queue::plan_run_live(&rows, &idx, apply, p.cancel_flag(), &mut |ev| match ev {
+            RunEvent::Start { file, name, repo, pos, total } => {
+                p.set(format!("{}/{} 적용 중 — {} → {}", pos + 1, total, name, repo_folder(repo)));
+                p.push_live(Live::Start { file: file.to_string() });
+            }
+            RunEvent::Done { outcome, retry } => p.push_live(Live::Done { outcome: outcome.clone(), retry }),
+        });
         Box::new(move |st: &mut AppState| {
             let mut outcomes = outcomes;
             if apply {

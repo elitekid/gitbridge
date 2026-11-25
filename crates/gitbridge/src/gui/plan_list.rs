@@ -3,6 +3,7 @@
 
 use super::common::{kind_label, outcome_status, Status};
 use super::theme::Bold;
+use super::worker::Live;
 use super::{theme, widgets};
 use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke};
 use gitbridge_core::queue::{self, PlanRow, QueuePlan};
@@ -12,9 +13,30 @@ use std::collections::HashMap;
 /// 체크 칸 폭.
 const CHK_W: f32 = 28.0;
 
+/// 적용 실행 중 이 줄이 어디까지 왔는가.
+#[derive(Clone, Copy, Default, PartialEq)]
+enum RunState {
+    /// 실행 대상이 아니거나 이미 끝났다.
+    #[default]
+    Idle,
+    /// 이번 실행 대상이고 차례를 기다린다.
+    Queued,
+    /// 지금 적용하는 중이다.
+    Running,
+}
+
+/// 칼럼 폭 기본 비율(번들, 저장소). 나머지는 상태 칸이다.
+const COL_DEFAULT: [f32; 2] = [0.38, 0.24];
+/// 칼럼 최소 폭.
+const COL_MIN_W: f32 = 70.0;
+/// 지금 적용 중인 줄의 배경.
+const RUN_BG: Color32 = Color32::from_rgb(0xF4, 0xF1, 0xDD);
+
 /// 줄 하나의 화면 쪽 상태.
 #[derive(Clone, Default)]
 struct RowUi {
+    /// 적용 실행 중 진행 상태.
+    run: RunState,
     /// 적용 체크.
     checked: bool,
     /// 줄 선택(저장소 바꾸기 등의 대상).
@@ -29,7 +51,7 @@ struct RowUi {
 
 #[derive(Clone)]
 struct RowResult {
-    /// 상태 칸에 보일 '[종류] 첫 줄'.
+    /// 상태 칸에 보일 짧은 문구(완료는 종류, 그 밖은 '종류 — 첫 줄').
     text: String,
     /// 마우스를 올렸을 때 보일 전체 문구.
     full: String,
@@ -42,6 +64,24 @@ pub struct PlanList {
     pub plan: Option<QueuePlan>,
     rows: Vec<RowUi>,
     loading: bool,
+    /// 번들·저장소 칼럼 폭 비율(끌어서 바꾼 값). 없으면 기본값.
+    col: Option<[f32; 2]>,
+    /// 적용 실행 중 이번 실행 줄 수, 끝난 줄 수, 멈춘 줄 수.
+    run_total: usize,
+    run_done: usize,
+    run_stop: usize,
+    /// 방금 적용을 시작한 줄(표가 그 줄로 스크롤한다).
+    follow: Option<usize>,
+}
+
+/// 실행 결과 하나를 줄 상태 칸에 보일 모양으로 만든다.
+/// 칸에는 짧게(완료는 종류만, 그 밖은 종류와 첫 줄) 보이고 전체 문구는 마우스를 올리면 나온다.
+fn result_of(o: &Outcome) -> RowResult {
+    let status = outcome_status(o);
+    let kind = kind_label(&o.kind);
+    let first = o.message.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with("판정한 저장소 폴더:")).unwrap_or("");
+    let text = if status == Status::Done || first.is_empty() { kind.clone() } else { format!("{} — {}", kind, first) };
+    RowResult { text, full: format!("[{}] {}", kind, o.message), status }
 }
 
 /// 처음부터 체크해 둘 줄인가: 저장소가 있고, 엔진이 체크로 정했고, 전에 적용한 적이 없을 때.
@@ -68,6 +108,9 @@ impl PlanList {
     /// 매 프레임 처음에 부른다. plan 이 없고 작업 스레드에도 없으면(작업이 비정상으로 끝남) 새로 만든다.
     /// 참이면 목록이 비정상으로 사라져 비웠다는 뜻.
     pub fn ensure(&mut self, busy: bool) -> bool {
+        if !busy {
+            self.end_run();
+        }
         if self.plan.is_none() && !(self.loading && busy) {
             let lost = self.loading;
             self.plan = Some(QueuePlan::new());
@@ -77,6 +120,84 @@ impl PlanList {
         }
         self.sync();
         false
+    }
+
+    /// 적용을 시작한다: 이번에 돌 줄은 이전 결과를 지우고 '순서 대기'로 둔다.
+    pub fn begin_run(&mut self, idx: &[usize]) {
+        self.sync();
+        for u in self.rows.iter_mut() {
+            u.run = RunState::Idle;
+        }
+        for &i in idx {
+            if let Some(u) = self.rows.get_mut(i) {
+                u.run = RunState::Queued;
+                u.result = None;
+            }
+        }
+        self.run_total = idx.len();
+        self.run_done = 0;
+        self.run_stop = 0;
+        self.follow = None;
+    }
+
+    /// 실행이 끝났거나 멈췄을 때 진행 표시를 걷는다(작업이 비정상으로 끝나도 '적용 중'이 남지 않게 매 프레임 확인).
+    fn end_run(&mut self) {
+        if self.run_total == 0 && self.follow.is_none() && self.rows.iter().all(|u| u.run == RunState::Idle) {
+            return;
+        }
+        for u in self.rows.iter_mut() {
+            u.run = RunState::Idle;
+        }
+        self.run_total = 0;
+        self.run_done = 0;
+        self.run_stop = 0;
+        self.follow = None;
+    }
+
+    /// 작업 스레드가 올린 줄 단위 소식을 줄 상태에 바로 반영한다(매 프레임).
+    pub fn pump(&mut self, events: Vec<Live>) {
+        for ev in events {
+            match ev {
+                Live::Start { file, .. } => {
+                    if let Some(i) = self.rows.iter().position(|u| u.path == file) {
+                        self.rows[i].run = RunState::Running;
+                        self.follow = Some(i);
+                    }
+                }
+                Live::Done { outcome, retry } => {
+                    let Some(file) = outcome.file.as_deref() else { continue };
+                    let Some(i) = self.rows.iter().position(|u| u.path == file) else { continue };
+                    let u = &mut self.rows[i];
+                    if retry {
+                        // 앞 번들이 들어간 뒤 한 번 더 시도한다. 지금은 결과를 보이지 않고 차례를 기다린다.
+                        u.run = RunState::Queued;
+                        u.result = None;
+                        continue;
+                    }
+                    let res = result_of(&outcome);
+                    if res.status == Status::Done {
+                        u.checked = false;
+                    } else if res.status == Status::Stop {
+                        self.run_stop += 1;
+                    }
+                    u.result = Some(res);
+                    u.run = RunState::Idle;
+                    self.run_done += 1;
+                }
+            }
+        }
+    }
+
+    /// 적용 중이면 목록 위에 보일 한 줄(끝난 줄 수 / 이번 실행 줄 수).
+    pub fn run_text(&self) -> Option<String> {
+        if self.run_total == 0 {
+            return None;
+        }
+        let mut t = format!("적용 중 {}/{}", self.run_done, self.run_total);
+        if self.run_stop > 0 {
+            t += &format!(" · 멈춤 {}개", self.run_stop);
+        }
+        Some(t)
     }
 
     /// 작업 스레드로 plan 을 옮기려고 꺼낸다. 돌려놓을 때까지 loading.
@@ -133,14 +254,14 @@ impl PlanList {
                     self.rows.push(u);
                 } else {
                     // 옛 상태가 없는 새 줄.
-                    self.rows.push(RowUi { checked: default_checked(r), selected: false, repo: r.repo.clone(), result: None, path: r.path.clone() });
+                    self.rows.push(RowUi { checked: default_checked(r), selected: false, repo: r.repo.clone(), result: None, path: r.path.clone(), run: RunState::Idle });
                 }
             }
         }
         self.rows.truncate(plan.rows.len());
         for (i, r) in plan.rows.iter().enumerate() {
             if i >= self.rows.len() {
-                self.rows.push(RowUi { checked: default_checked(r), selected: false, repo: r.repo.clone(), result: None, path: r.path.clone() });
+                self.rows.push(RowUi { checked: default_checked(r), selected: false, repo: r.repo.clone(), result: None, path: r.path.clone(), run: RunState::Idle });
             } else {
                 let u = &mut self.rows[i];
                 if u.repo != r.repo {
@@ -297,9 +418,9 @@ impl PlanList {
             // 한 줄에 결과가 여럿이면 실패를 먼저, 없으면 마지막 것을 보인다.
             let pick = mine.iter().copied().find(|o| !o.ok).or_else(|| mine.last().copied());
             if let Some(o) = pick {
-                let status = outcome_status(o);
-                let first = o.message.lines().find(|l| !l.starts_with("판정한 저장소 폴더:")).unwrap_or("").trim();
-                u.result = Some(RowResult { text: format!("[{}] {}", kind_label(&o.kind), first), full: format!("[{}] {}", kind_label(&o.kind), o.message), status });
+                let res = result_of(o);
+                let status = res.status;
+                u.result = Some(res);
                 if status == Status::Done {
                     u.checked = false;
                 }
@@ -365,6 +486,9 @@ impl PlanList {
         let rem = (ui.available_height() - 10.0).max(60.0);
         let Some(plan) = self.plan.as_ref() else { return };
         let rows_ui = &mut self.rows;
+        let follow = self.follow.take();
+        let mut col = self.col.unwrap_or(COL_DEFAULT);
+        let mut col_changed = false;
         let mut clicked: Option<(usize, bool)> = None;
         let mut toggle_all = false;
         egui::Frame::new().fill(theme::LOG_BG).stroke(Stroke::new(1.0, theme::LINE)).corner_radius(CornerRadius::same(6)).inner_margin(Margin::symmetric(10, 4)).show(ui, |ui| {
@@ -376,8 +500,8 @@ impl PlanList {
             let cw = ui.available_width() - ui.spacing().scroll.allocated_width();
             let name_x = 2.0 + CHK_W;
             let rest = (cw - name_x - 2.0 - 16.0).max(120.0);
-            let name_w = rest * 0.34;
-            let repo_w = rest * 0.34;
+            let name_w = rest * col[0];
+            let repo_w = rest * col[1];
             let st_w = rest - name_w - repo_w;
             let repo_x = name_x + name_w + 8.0;
             let st_x = repo_x + repo_w + 8.0;
@@ -392,13 +516,44 @@ impl PlanList {
                         ui.label(RichText::new(name).size(12.0).color(theme::SUB));
                     });
                 }
+                // 칼럼 경계를 끌어 폭을 바꾼다(두 번 누르면 기본 폭). 번들 경계는 번들 칸, 저장소 경계는 저장소 칸 폭을 바꾸고 상태 칸이 나머지를 쓴다.
+                let min_f = (COL_MIN_W / rest).min(0.3);
+                for k in 0..2 {
+                    let bx = head.left() + if k == 0 { repo_x } else { st_x } - 4.0;
+                    let hr = egui::Rect::from_center_size(egui::pos2(bx, head.center().y), egui::vec2(10.0, head.height()));
+                    let resp = ui.interact(hr, ui.scope_id().with(("plan_col_resize", k)), egui::Sense::click_and_drag());
+                    let active = resp.hovered() || resp.dragged();
+                    if active {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                    }
+                    ui.painter().vline(bx, head.y_range().shrink(6.0), Stroke::new(if active { 2.0 } else { 1.0 }, if active { theme::ACCENT } else { theme::LINE }));
+                    if resp.double_clicked() {
+                        col[k] = COL_DEFAULT[k];
+                        col_changed = true;
+                    } else if resp.dragged() {
+                        let other = col[1 - k];
+                        let hi = (1.0 - other - min_f).max(min_f);
+                        col[k] = (col[k] + resp.drag_delta().x / rest).clamp(min_f, hi);
+                        col_changed = true;
+                    }
+                    // 두 칸 비율의 합이 상태 칸 최소 폭을 침범하면 건드리지 않은 쪽을 줄여 상태 칸이 밀려나지 않게 한다.
+                    if col[0] + col[1] > 1.0 - min_f {
+                        col[1 - k] = (1.0 - min_f - col[k]).max(min_f);
+                    }
+                }
             }
             egui::ScrollArea::vertical().id_salt("apply_plan_list").auto_shrink([false, false]).show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 for (i, (r, u)) in plan.rows.iter().zip(rows_ui.iter_mut()).enumerate() {
                     let row = widgets::row_rect(ui, widgets::ROW_H);
+                    if follow == Some(i) {
+                        ui.scroll_to_rect(row, Some(egui::Align::Center));
+                    }
                     // 줄 전체 클릭(선택). 뒤에 만드는 체크 칸이 자기 영역의 클릭을 가져간다.
                     let rr = ui.interact(row, ui.scope_id().with(("plan_row", i)), egui::Sense::click());
+                    if u.run == RunState::Running {
+                        ui.painter().rect_filled(egui::Rect::from_min_max(row.min, egui::pos2(row.max.x, row.max.y - 1.0)), CornerRadius::ZERO, RUN_BG);
+                    }
                     if u.selected || rr.hovered() {
                         let fill = if u.selected { theme::SEL_BG } else { ui.visuals().faint_bg_color };
                         ui.painter().rect_filled(egui::Rect::from_min_max(row.min, egui::pos2(row.max.x, row.max.y - 1.0)), CornerRadius::ZERO, fill);
@@ -443,9 +598,16 @@ impl PlanList {
                             ui.add(egui::Label::new(RichText::new(repo_name(&r.repo))).truncate()).on_hover_text(r.repo.as_str());
                         }
                     });
-                    // 상태: 실행 결과 > 전에 적용함 > 대기 > 저장소가 없는 이유
+                    // 상태: 적용 중·순서 대기 > 실행 결과 > 전에 적용함 > 대기 > 저장소가 없는 이유
                     widgets::cell(ui, row, st_x, st_w, |ui| {
-                        let (text, color, tip): (String, Color32, String) = if let Some(res) = &u.result {
+                        if u.run == RunState::Running {
+                            ui.add(egui::Spinner::new().size(13.0).color(theme::ACCENT));
+                        }
+                        let (text, color, tip): (String, Color32, String) = if u.run == RunState::Running {
+                            ("적용 중…".to_string(), theme::ACCENT, "지금 이 번들을 저장소에 적용하는 중입니다.".to_string())
+                        } else if u.run == RunState::Queued {
+                            ("순서 대기".to_string(), theme::IDLE, "이번 적용 대상입니다. 앞 번들이 끝나면 적용합니다.".to_string())
+                        } else if let Some(res) = &u.result {
                             (res.text.clone(), res.status.color(), res.full.clone())
                         } else if !r.seen.is_empty() {
                             let t = format!("전에 적용함 ({})", r.seen);
@@ -465,6 +627,9 @@ impl PlanList {
                 }
             });
         });
+        if col_changed {
+            self.col = Some(col);
+        }
         // 줄 선택: 클릭 = 그 줄만, Ctrl+클릭 = 토글.
         if let Some((i, ctrl)) = clicked {
             if ctrl {

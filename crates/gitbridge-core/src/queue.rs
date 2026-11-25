@@ -824,7 +824,7 @@ fn run_rows(expanded: &archive::ExpandedInputs, src_root: &str, apply: bool, set
     let mut rows = build_rows(expanded, src_root, false, settings, history, out);
     let pending: Vec<usize> = (0..rows.len()).filter(|&i| !rows[i].repo.is_empty()).collect();
     let first_new = out.len();
-    run_apply_rows(&mut rows, pending, apply, settings, out, cancel);
+    run_apply_rows(&mut rows, pending, apply, settings, out, cancel, &mut |_| {});
     // 결과의 '파일' 은 임시 폴더 경로 대신 "ZIP > 번들 이름" 으로 보인다(폴더 큐·CLI 경로).
     for o in out[first_new..].iter_mut() {
         if let Some(r) = rows.iter().find(|r| !r.archive.is_empty() && o.file.as_deref() == Some(r.path.as_str())) {
@@ -873,7 +873,15 @@ fn repo_fit_problem(rows: &[Row], i: usize) -> Option<String> {
 
 /// pending(rows 의 색인) 줄을 위에서부터 적용하고(apply 가 참일 때), 모든 줄의 결과를 rows 순서로 out 에 붙인다.
 /// 앞 번들이 아직 안 들어가 "기대는 커밋이 없다"로 멈춘 줄은 재시도하고, 취소되면 남은 줄은 '취소로 보류'로 남긴다.
-fn run_apply_rows(rows: &mut [Row], mut pending: Vec<usize>, apply: bool, settings: &mut Value, out: &mut Vec<Outcome>, cancel: &AtomicBool) {
+/// 적용 중 줄 하나마다 보내는 진행 알림.
+pub enum RunEvent<'a> {
+    /// pos(0부터, 이번 실행 줄 순서)번째 줄의 적용을 시작한다. file 은 줄의 번들 경로.
+    Start { file: &'a str, name: &'a str, repo: &'a str, pos: usize, total: usize },
+    /// 한 줄의 결과. retry 가 참이면 앞 번들을 기다리느라 뒤에서 한 번 더 시도한다.
+    Done { outcome: &'a Outcome, retry: bool },
+}
+
+fn run_apply_rows(rows: &mut [Row], mut pending: Vec<usize>, apply: bool, settings: &mut Value, out: &mut Vec<Outcome>, cancel: &AtomicBool, on_event: &mut dyn FnMut(RunEvent)) {
     if apply {
         let mut recorded: HashSet<usize> = HashSet::new();
         let mut attempted: Vec<usize> = Vec::new();
@@ -898,6 +906,7 @@ fn run_apply_rows(rows: &mut [Row], mut pending: Vec<usize>, apply: bool, settin
                     attempted.push(i);
                 }
                 crate::log::say(&format!("===== [{}] {} → {}", i + 1, base_name(&rows[i].path), rows[i].repo));
+                on_event(RunEvent::Start { file: &rows[i].path, name: &base_name(&rows[i].path), repo: &rows[i].repo, pos: i, total: rows.len() });
                 if let Some(msg) = repo_fit_problem(rows, i) {
                     let mut o = Outcome::stop(msg);
                     o.file = Some(rows[i].path.clone());
@@ -905,6 +914,7 @@ fn run_apply_rows(rows: &mut [Row], mut pending: Vec<usize>, apply: bool, settin
                     rows[i].result = Some(o);
                     record(&rows[i], rows[i].result.as_ref().unwrap());
                     recorded.insert(i);
+                    on_event(RunEvent::Done { outcome: rows[i].result.as_ref().unwrap(), retry: false });
                     continue;
                 }
                 let mut o = crate::apply::apply(&rows[i].path, &rows[i].repo, rows[i].sync_all);
@@ -920,6 +930,7 @@ fn run_apply_rows(rows: &mut [Row], mut pending: Vec<usize>, apply: bool, settin
                     progress = true;
                 }
                 rows[i].result = Some(o);
+                on_event(RunEvent::Done { outcome: rows[i].result.as_ref().unwrap(), retry: again });
                 if again {
                     retry.push(i);
                 } else {
@@ -1446,6 +1457,12 @@ pub fn plan_remove(plan: &mut QueuePlan, idx: &[usize]) {
 /// 각 Outcome.file 은 그 줄의 번들 경로다. repo 가 빈 줄은 결과에 넣지 않는다.
 /// 줄 사본만 받으므로 화면은 도는 동안에도 목록을 그대로 보여 준다(저장소를 다시 찾지 않는다).
 pub fn plan_run(plan_rows: &[PlanRow], idx: &[usize], apply: bool, cancel: &AtomicBool) -> Vec<Outcome> {
+    plan_run_live(plan_rows, idx, apply, cancel, &mut |_| {})
+}
+
+/// plan_run 과 같고, 적용 중 줄마다 시작·끝을 on_event 로 알린다(화면이 줄 상태를 바로 바꾸게).
+/// 알림은 진행 표시용이다. 최종 결과는 돌려주는 Outcome 목록이 기준이다.
+pub fn plan_run_live(plan_rows: &[PlanRow], idx: &[usize], apply: bool, cancel: &AtomicBool, on_event: &mut dyn FnMut(RunEvent)) -> Vec<Outcome> {
     let want: HashSet<usize> = idx.iter().copied().collect();
     let mut rows: Vec<Row> = Vec::new();
     for (i, p) in plan_rows.iter().enumerate() {
@@ -1472,6 +1489,6 @@ pub fn plan_run(plan_rows: &[PlanRow], idx: &[usize], apply: bool, cancel: &Atom
         json!({})
     };
     let pending: Vec<usize> = (0..rows.len()).collect();
-    run_apply_rows(&mut rows, pending, apply, &mut settings, &mut out, cancel);
+    run_apply_rows(&mut rows, pending, apply, &mut settings, &mut out, cancel, on_event);
     out
 }

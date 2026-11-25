@@ -3,6 +3,7 @@
 
 use super::AppState;
 use eframe::egui;
+use gitbridge_core::refs::Outcome;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -10,14 +11,39 @@ use std::sync::{Arc, Mutex};
 /// 작업이 끝난 뒤 화면 스레드에서 상태에 반영할 일.
 pub type Apply = Box<dyn FnOnce(&mut AppState) + Send>;
 
+/// 여러 줄을 차례로 도는 작업이 줄마다 올리는 진행 소식(화면 스레드가 매 프레임 꺼내 간다).
+pub enum Live {
+    /// 줄 하나의 적용을 시작했다. file 은 줄의 번들 경로.
+    Start { file: String },
+    /// 줄 하나의 결과가 나왔다. retry 면 앞 번들을 기다려 뒤에서 한 번 더 시도한다.
+    Done { outcome: Outcome, retry: bool },
+}
+
 /// 작업 스레드가 진행 문구를 올리고 취소 요청을 읽는 곳.
 #[derive(Default)]
 pub struct Progress {
     stage: Mutex<String>,
     cancel: Arc<AtomicBool>,
+    live: Mutex<Vec<Live>>,
+    ctx: Mutex<Option<egui::Context>>,
 }
 
 impl Progress {
+    /// 줄 단위 소식을 올리고 화면을 바로 다시 그리게 한다(작업 스레드에서).
+    pub fn push_live(&self, ev: Live) {
+        if let Ok(mut v) = self.live.lock() {
+            v.push(ev);
+        }
+        if let Ok(c) = self.ctx.lock() {
+            if let Some(c) = c.as_ref() {
+                c.request_repaint();
+            }
+        }
+    }
+    /// 올라온 줄 단위 소식을 모두 꺼낸다(화면 스레드에서).
+    pub fn take_live(&self) -> Vec<Live> {
+        self.live.lock().map(|mut v| std::mem::take(&mut *v)).unwrap_or_default()
+    }
     /// 진행 줄 문구를 바꾼다(작업 스레드에서).
     pub fn set(&self, text: impl Into<String>) {
         if let Ok(mut s) = self.stage.lock() {
@@ -81,6 +107,9 @@ impl Jobs {
             return false;
         }
         let progress = Arc::new(Progress::default());
+        if let Ok(mut c) = progress.ctx.lock() {
+            *c = self.ctx.clone();
+        }
         progress.set(label);
         let p = progress.clone();
         let tx = self.tx.clone();
