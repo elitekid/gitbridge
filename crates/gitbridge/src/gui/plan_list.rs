@@ -667,8 +667,11 @@ impl PlanList {
                 let bar = egui::Rect::from_min_max(egui::pos2(inner.right() - 14.0, inner.top()), inner.max);
                 scrolled_now = ui.input(|i| {
                     let wheel = wheel_before && i.pointer.hover_pos().map(|p| inner.contains(p)).unwrap_or(false);
-                    // 스크롤바 위에서 누른 채 실제로 움직였을 때만(단순 클릭은 제외). 칼럼 폭을 끄는 중이면 제외한다.
-                    let drag = !col_changed && i.pointer.primary_down() && i.pointer.delta().y != 0.0 && i.pointer.hover_pos().map(|p| bar.contains(p)).unwrap_or(false);
+                    // 스크롤바에서 누르기 시작해 임계 거리 넘게 끌고 있을 때만(단순 클릭은 제외). 칼럼 폭을 끄는 중이면 제외한다.
+                    let drag = !col_changed
+                        && i.pointer.is_decidedly_dragging()
+                        && i.pointer.delta().y != 0.0
+                        && i.pointer.press_origin().map(|p| bar.contains(p)).unwrap_or(false);
                     wheel || drag
                 });
             }

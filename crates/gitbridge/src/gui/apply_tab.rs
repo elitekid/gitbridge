@@ -240,9 +240,10 @@ pub fn ui(st: &mut AppState, ui: &mut egui::Ui) {
         // 기록 창이 열려 본문이 낮을 때 아래 결과 카드가 창 밖으로 밀려 마지막 항목이 잘렸다.
         // 결과가 생기면 결과 카드가 남은 높이의 40% 까지 커지는데, 낮은 창에서는 목록이 너무 줄어들지 않게
         // 목록 카드 최소 높이(MIN_LIST_H)를 먼저 지키고 결과 카드를 줄인다(결과 카드 안은 스크롤된다).
+        // 결과 카드는 60 아래로는 줄이지 않으므로 avail 이 MIN_LIST_H+gap+60 보다 작으면 목록이 그만큼 줄어든다.
         const MIN_LIST_H: f32 = 300.0;
         let res_h = if has_res {
-            ((avail - gap) * 0.40).max(100.0).min((avail - gap - MIN_LIST_H).max(100.0)).min((avail - gap - 90.0).max(60.0))
+            ((avail - gap) * 0.40).max(100.0).min((avail - gap - MIN_LIST_H).max(60.0)).min((avail - gap - 90.0).max(60.0))
         } else {
             80.0
         };
