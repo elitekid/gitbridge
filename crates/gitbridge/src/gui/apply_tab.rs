@@ -238,7 +238,14 @@ pub fn ui(st: &mut AppState, ui: &mut egui::Ui) {
         let has_res = !s.outcomes.is_empty() || !s.preview_outcomes.is_empty();
         // 위·아래 카드 높이의 합이 남은 높이(avail)를 넘지 않게 한다: 최소 높이를 억지로 주면(위 200 + 아래 140)
         // 기록 창이 열려 본문이 낮을 때 아래 결과 카드가 창 밖으로 밀려 마지막 항목이 잘렸다.
-        let res_h = if has_res { ((avail - gap) * 0.40).max(100.0).min((avail - gap - 90.0).max(60.0)) } else { 80.0 };
+        // 결과가 생기면 결과 카드가 남은 높이의 40% 까지 커지는데, 낮은 창에서는 목록이 너무 줄어들지 않게
+        // 목록 카드 최소 높이(MIN_LIST_H)를 먼저 지키고 결과 카드를 줄인다(결과 카드 안은 스크롤된다).
+        const MIN_LIST_H: f32 = 300.0;
+        let res_h = if has_res {
+            ((avail - gap) * 0.40).max(100.0).min((avail - gap - MIN_LIST_H).max(100.0)).min((avail - gap - 90.0).max(60.0))
+        } else {
+            80.0
+        };
         let top_h = if s.mode_dir { 150.0_f32.min(avail - gap - res_h).max(90.0) } else { (avail - gap - res_h).max(90.0) };
         let w = ui.available_width();
         let stroke = if hovering { Stroke::new(2.0, theme::ACCENT) } else { Stroke::new(1.0, theme::LINE) };
