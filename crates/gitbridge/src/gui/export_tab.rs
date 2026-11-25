@@ -62,7 +62,7 @@ pub struct ExportState {
     /// 저장소별 로컬 작업 브랜치 목록(path_key 기준). 그리는 중에는 git 을 부르지 않고 뒤에서 읽어 둔 것만 쓴다.
     branches: HashMap<String, BranchInfo>,
     /// 뒤에서 목록을 읽는 중이면 그 결과를 받는 통로.
-    branch_rx: Option<std::sync::mpsc::Receiver<Vec<(String, BranchInfo)>>>,
+    branch_rx: Option<std::sync::mpsc::Receiver<(Vec<(String, BranchInfo)>, std::time::Duration)>>,
     /// 목록 전체를 다시 읽어야 한다는 표시(처음 열 때·사용자가 누른 다시 찾기).
     /// 목록에 새로 들어온(아직 읽지 않은) 저장소는 이 표시 없이도 읽는다.
     branch_dirty: bool,
@@ -83,7 +83,12 @@ pub struct ExportState {
     seen_frame: u64,
     /// 지난 프레임에 창이 포커스를 갖고 있었는지(다시 얻는 순간을 알아본다).
     was_focused: bool,
+    /// 작업 브랜치 범위를 보는 동안 체크한 저장소를 다시 읽을 다음 시각(앱 밖에서 만든 브랜치가 포커스·탭 전환과 무관하게 보이게 한다).
+    next_poll: Option<std::time::Instant>,
 }
+
+/// 작업 브랜치 범위를 보는 동안 체크한 저장소의 브랜치를 다시 읽는 최소 간격(저장소당 git 1번).
+const BRANCH_POLL: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// 목록에서 빼기 확인 대화에 보여 줄 내용.
 #[derive(Clone, Default)]
@@ -144,7 +149,7 @@ fn read_branch_info(repo: &str) -> BranchInfo {
 
 /// 뒤에서 읽은 결과를 받고, 다시 읽을 일이 있으면 시작한다. 1.0.5 처럼 목록에 없는 저장된 브랜치는 현재 브랜치로 바꿔 저장한다.
 fn pump_branches(st: &mut AppState, ctx: &egui::Context) {
-    let mut done: Option<Vec<(String, BranchInfo)>> = None;
+    let mut done: Option<(Vec<(String, BranchInfo)>, std::time::Duration)> = None;
     if let Some(rx) = &st.export.branch_rx {
         match rx.try_recv() {
             Ok(v) => done = Some(v),
@@ -152,8 +157,10 @@ fn pump_branches(st: &mut AppState, ctx: &egui::Context) {
             Err(std::sync::mpsc::TryRecvError::Disconnected) => st.export.branch_rx = None,
         }
     }
-    if let Some(v) = done {
+    if let Some((v, took)) = done {
         st.export.branch_rx = None;
+        // 읽기가 오래 걸렸으면 그만큼 간격을 늘려 저장소가 많아도 계속 읽기만 하지 않게 한다(작업 스레드가 잰 실제 읽기 시간).
+        st.export.next_poll = Some(std::time::Instant::now() + BRANCH_POLL.max(took * 4));
         // 읽는 사이 목록에서 뺀 저장소의 결과는 버린다(다시 넣을 때 옛 값으로 남지 않게).
         let live: HashSet<String> = st.export.repos.iter().map(|e| path_key(entry_path(e))).collect();
         for (k, info) in v {
@@ -201,8 +208,9 @@ fn pump_branches(st: &mut AppState, ctx: &egui::Context) {
         let c2 = ctx.clone();
         st.export.branch_rx = Some(rx);
         std::thread::spawn(move || {
+            let t0 = std::time::Instant::now();
             let v: Vec<(String, BranchInfo)> = paths.iter().map(|p| (path_key(p), read_branch_info(p))).collect();
-            let _ = tx.send(v);
+            let _ = tx.send((v, t0.elapsed()));
             c2.request_repaint();
         });
     }
@@ -713,6 +721,19 @@ pub fn ui(st: &mut AppState, ui: &mut egui::Ui) {
     if back && st.export.scope == Scope::Feature {
         let checked = checked_paths(st);
         st.export.branch_need.extend(checked);
+    }
+    // 포커스·탭 전환 이벤트가 안 와도(또는 그 이벤트를 놓쳐도) 보고 있는 동안 몇 초마다 체크한 저장소를 다시 읽는다.
+    // 이미 읽는 중이면 끝난 뒤로 미루고, 최소화돼 있으면 읽지 않는다. 읽은 값이 같으면 화면은 그대로다.
+    if st.export.scope == Scope::Feature {
+        let minimized = ctx.input(|i| i.viewport().minimized).unwrap_or(false);
+        let due = st.export.next_poll.map_or(true, |t| std::time::Instant::now() >= t);
+        if due && !minimized && st.export.branch_rx.is_none() {
+            let checked = checked_paths(st);
+            st.export.branch_need.extend(checked);
+            st.export.next_poll = Some(std::time::Instant::now() + BRANCH_POLL);
+        }
+        // 가만히 보고 있어도 프레임이 돌아 위 확인이 이어지게 한다.
+        ctx.request_repaint_after(BRANCH_POLL);
     }
     pump_branches(st, &ctx);
     let busy = st.busy();
@@ -1231,6 +1252,8 @@ fn start_make(st: &mut AppState) {
         return;
     }
     st.save_setting("exportDir", json!(out_dir.clone()));
+    // 시작하는 순간에도 대상 저장소의 브랜치 정보를 한 번 다시 읽어 목록을 최신으로 맞춘다(만드는 동안 뒤에서 읽는다).
+    st.export.branch_need.extend(repos.iter().cloned());
     let base: Option<String> = if base_text.is_empty() { None } else { Some(base_text) };
     st.spawn("번들 만들기", move |p: &Progress| -> Apply {
         let mut outs: Vec<Outcome> = Vec::new();
@@ -1320,6 +1343,8 @@ fn start_preview(st: &mut AppState) {
     if scope == "feature" && !check_features(st, &repos, &feats) {
         return;
     }
+    // 미리보기를 시작하는 순간에도 대상 저장소의 브랜치 정보를 한 번 다시 읽는다.
+    st.export.branch_need.extend(repos.iter().cloned());
     let base: Option<String> = if base_text.is_empty() { None } else { Some(base_text) };
     st.spawn("미리보기", move |p: &Progress| -> Apply {
         let mut lines: Vec<String> = Vec::new();
