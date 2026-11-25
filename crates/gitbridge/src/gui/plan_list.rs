@@ -563,6 +563,13 @@ impl PlanList {
             if reset_scroll {
                 area = area.vertical_scroll_offset(0.0);
             }
+            // 휠 입력은 목록이 소비하면 지워지므로 그리기 전에 읽어 둔다(egui ScrollArea 가 소비한 뒤에는 0).
+            let wheel_before = if running {
+                let over = ui.max_rect();
+                ui.input(|i| i.smooth_scroll_delta.y != 0.0 && i.pointer.hover_pos().is_some_and(|p| over.contains(p)))
+            } else {
+                false
+            };
             let list_out = area.show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 for (i, (r, u)) in plan.rows.iter().zip(rows_ui.iter_mut()).enumerate() {
@@ -659,10 +666,9 @@ impl PlanList {
                 let inner = list_out.inner_rect;
                 let bar = egui::Rect::from_min_max(egui::pos2(inner.right() - 14.0, inner.top()), inner.max);
                 scrolled_now = ui.input(|i| {
-                    let over = i.pointer.hover_pos().map(|p| inner.contains(p)).unwrap_or(false);
-                    let wheel = over && i.smooth_scroll_delta.y != 0.0;
-                    // 스크롤바 위에서 누른 채 실제로 움직였을 때만(단순 클릭은 제외).
-                    let drag = i.pointer.primary_down() && i.pointer.delta().y != 0.0 && i.pointer.hover_pos().map(|p| bar.contains(p)).unwrap_or(false);
+                    let wheel = wheel_before && i.pointer.hover_pos().map(|p| inner.contains(p)).unwrap_or(false);
+                    // 스크롤바 위에서 누른 채 실제로 움직였을 때만(단순 클릭은 제외). 칼럼 폭을 끄는 중이면 제외한다.
+                    let drag = !col_changed && i.pointer.primary_down() && i.pointer.delta().y != 0.0 && i.pointer.hover_pos().map(|p| bar.contains(p)).unwrap_or(false);
                     wheel || drag
                 });
             }
