@@ -41,6 +41,12 @@ pub fn ui(st: &mut AppState, ui: &mut egui::Ui) {
         }
         ui.add_space(8.0);
 
+        ui.label(RichText::new("2.0.3").bold().size(16.0));
+        for l in ["업데이트 탭 변경 내역에 2.0.2 항목이 빠져 있던 것을 채웠습니다."] {
+            ui.label(format!("- {}", l));
+        }
+        ui.add_space(6.0);
+
         ui.label(RichText::new("2.0.2").bold().size(16.0));
         for l in [
             "번들 적용 탭에서 적용 중인 행과 상태(완료·확인 필요·멈춤·대기 등)가 실시간으로 보입니다. 번들·저장소·상태 칼럼 폭을 끌어서 조절할 수 있고, 칼럼 경계를 더블클릭하면 기본 폭으로 돌아갑니다.",
